@@ -924,7 +924,12 @@ score.hypotheses = function(hypotheses, covariates = names(values(hypotheses)), 
         formula = eval(parse(text = paste('count', " ~ ", paste(c('offset(1*eligible)', covariates), collapse = "+")))) ## make the formula with covariates
 
       if (nb){
-            g = glm.nb(formula, data = as.data.frame(tdt), maxit = iter)
+        ##Kiran modified to return error message
+        tryCatch({
+           g = glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
+           error = function(e){
+           stop("Use Poisson")}
+           )      
       } else{
         if (verbose)
         {
@@ -2043,7 +2048,9 @@ FishHook = R6::R6Class('FishHook',
           {
             if (!is.null(genome))
             {
-              genome = tryCatch(hg_seqlengths(genome), error = function(e) NULL)
+              genome = tryCatch
+
+              (hg_seqlengths(genome), error = function(e) NULL)
               hypotheses = gr.fix(hypotheses, genome)
             }
             private$phypotheses = hypotheses
