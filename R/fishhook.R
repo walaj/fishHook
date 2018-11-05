@@ -928,7 +928,8 @@ score.hypotheses = function(hypotheses, covariates = names(values(hypotheses)), 
         tryCatch({
            g = glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
            error = function(e){
-           stop("Use Poisson")}
+           error$message <- "Fails to Fit NB"
+             stop(e}}
            )      
       } else{
         if (verbose)
