@@ -929,7 +929,7 @@ score.hypotheses = function(hypotheses, covariates = names(values(hypotheses)), 
            g = glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
            error = function(e){
            error$message <- "Fails to Fit NB"
-             stop(e}}
+             stop(e)}
            )      
       } else{
         if (verbose)
