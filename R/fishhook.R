@@ -2048,9 +2048,7 @@ FishHook = R6::R6Class('FishHook',
           {
             if (!is.null(genome))
             {
-              genome = tryCatch
-
-              (hg_seqlengths(genome), error = function(e) NULL)
+              genome = tryCatch(hg_seqlengths(genome), error = function(e) NULL)
               hypotheses = gr.fix(hypotheses, genome)
             }
             private$phypotheses = hypotheses
