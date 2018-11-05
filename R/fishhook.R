@@ -925,8 +925,8 @@ score.hypotheses = function(hypotheses, covariates = names(values(hypotheses)), 
 
       if (nb){
         ##Kiran modified to return error message
-        tryCatch({
-           g = glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
+        g <- tryCatch({
+           glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
            error = function(e){
            e$message <- "Fails to Fit NB"
              stop(e)}
