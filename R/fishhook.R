@@ -118,6 +118,115 @@ cache.newcol.write <- function(cache.dir, nm, type, new.col) {
   }
 }
 
+#' @name load.fish.track
+#' @description
+#'
+#' Loads the hypotheses (tiles or bins), accepting a saved RDS object,
+#' a BED file, a data.table or GRanges
+#' @return A data.table of hypotheses
+load.fish.track <- function(track) {
+
+  track.name <- ""
+  if (is.character(track)){
+    track.name <- track
+    if (grepl('\\.rds$', track[1])){
+      track = readRDS(track[1])
+    } else if (grepl('(\\.bed$)', track[1])){
+      track = rtracklayer::import(track[1], (format = "BED"))
+    }
+  }
+  
+  if (length(track)==0){
+    stop(paste('Error: Must provide non-empty track', track.name))
+  }
+  
+  return(gUtils::gr2dt(track))
+}
+
+#' @name check.covariates
+#' @description
+#'
+#' Perform type checking for the input covariates. Function will
+#' fail \code{stopifnot} if covariates are not allowed.
+check.covariates <- function(covariates) {
+  
+  COV.TYPES = c('numeric', 'sequence', 'interval')
+  COV.CLASSES = c('GRanges', 'RleList', 'ffTrack', 'character', 'data.table')
+  
+  cov.types = sapply(covariates, function(x) if (!is.null(x$type)) x$type else NA)
+  cov.classes = lapply(covariates, function(x) if (!is.null(x$track)) class(x$track) else NA)
+  
+  if (is.list(cov.types)) {
+    cov.types = ''
+  }
+  
+  if (is.list(cov.classes)) {
+    cov.classes = ''
+  }
+  
+  cov.types[is.na(cov.types)] = ''
+  
+  if (!all(cov.types %in% COV.TYPES) & !(all(cov.classes %in% COV.CLASSES))){
+    stop(sprintf('Error: Malformed covariate input: each covariate must be a list with fields $tracks and $type, $track must be of class GRanges, ffTrack, Rle, object, or character path to rds object with the latter or .bw, .bed file, $type must have value %s', paste(COV.TYPES, collapse = ',')))
+  }
+  
+  if (any(ix = (cov.types == 'sequence'))){
+    for (cov in covariates[ix]){
+      if (is.character(cov$track)){
+        cov$track = tryCatch(readRDS(cov$track), error = function(e) 'Error: not ffTrack')
+      }
+      if (class(cov$track) != 'ffTrack'){
+        stop('Error: Sequence tracks must have ffTrack object as $track field or $track must be a path to an ffTrack object rds file')
+      }
+    }
+  }
+  
+  if (any(ix = (cov.classes == 'ffTrack' & cov.types == 'sequence'))){
+    if (!all(sapply(covariates, function(x) !is.null(x$signature)))){
+      stop('Error: Sequence tracks must be ffTracks and have a $signature field specified (see fftab in ffTrack)')
+    }
+  }
+  
+}
+
+#' @name overlap.hypoth.covered
+#' @description
+#'
+#' Find the intervals in the intersection of the hypotheses (bins) and the
+#' covered (i.e. eligible) regions
+#' @return The overlapping intervals
+overlap.hypoth.covered <- function(hypotheses, covered, verbose) {
+  
+  fmessage('Overlapping with covered intervals', verbose=verbose)
+  if (!is.null(covered)){
+    cache.dir <- Sys.getenv("FISHCACHE")
+    fl <- file.path(cache.dir, "covered_ovl.rds")
+    if (file.exists(fl)) {
+      fmessage(paste("...reading overlaps from cache [FISHCACHE environment variable]:", fl,
+                     "To stop cache read, delete", basename(fl)), verbose=verbose)
+      ov <- readRDS(fl)
+    } else {
+      
+      #ov <- roverlaps::roverlaps(hypotheses, covered, verbose = verbose>1)        
+      ov = gr.findoverlaps(hypotheses, covered, verbose = verbose>1, max.chunk = max.chunk, mc.cores = mc.cores)
+      
+      if (nchar(cache.dir) > 0 && file.exists(cache.dir)) {
+        fmessage(paste("...caching overlaps to [FISHCACHE environment variable]:", fl,
+                       "To stop caching, remove FISHCACHE var", basename(fl)), verbose=verbose)
+        saveRDS(ov, file=fl, compress=FALSE)
+      }
+      
+    }
+  } else {
+    ov = hypotheses[, c()]
+    ov$query.id = ov$subject.id = 1:length(hypotheses)
+  }
+  
+  fmessage('Finished overlapping with covered intervals', verbose=verbose)
+
+  return(ov)
+}
+
 #' @name annotate.hypotheses
 #' @title title
 #' @description
@@ -172,210 +281,112 @@ cache.newcol.write <- function(cache.dir, nm, type, new.col) {
 annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.cores = 1, na.rm = TRUE, pad = 0, verbose = TRUE, max.slice = 1e4,
     ff.chunk = 1e6, max.chunk = 1e11, out.path = NULL, covariates = list(), idcap = Inf, idcol = NULL, weightEvents = FALSE, cache.dir=Sys.getenv("FISHCACHE"), ...)
 {
-  if(weightEvents){
-        idcap = NULL
-    }
-
-    if (is.character(hypotheses)){
-        if (grepl('\\.rds$', hypotheses[1])){
-            hypotheses = readRDS(hypotheses[1])
-        } else if (grepl('(\\.bed$)', hypotheses[1])){
-            require(rtracklayer)
-            hypotheses = rtracklayer::import(hypotheses[1], (format = "BED"))
-        }
-    }
-
-    if (length(hypotheses)==0){
-        stop('Error: Must provide non-empty hypotheses')
-    }
-
-    if (!is.null(out.path)){
-        tryCatch(saveRDS(hypotheses, paste(gsub('.rds', '', out.path), '.source.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
-    }
-
-    COV.TYPES = c('numeric', 'sequence', 'interval')
-    COV.CLASSES = c('GRanges', 'RleList', 'ffTrack', 'character')
-
-
-    cov.types = sapply(covariates, function(x) if (!is.null(x$type)) x$type else NA)
-    cov.classes = lapply(covariates, function(x) if (!is.null(x$track)) class(x$track) else NA)
-
-    if (is.list(cov.types)){
-        cov.type = ''
-    }
-
-    if (is.list(cov.classes)){
-        cov.classes = ''
-    }
-
-    cov.types[is.na(cov.types)] = ''
-
-    if (!all(cov.types %in% COV.TYPES) & !(all(cov.classes %in% COV.CLASSES))){
-        stop(sprintf('Error: Malformed covariate input: each covariate must be a list with fields $tracks and $type, $track must be of class GRanges, ffTrack, Rle, object, or character path to rds object with the latter or .bw, .bed file, $type must have value %s', paste(COV.TYPES, collapse = ',')))
-    }
-
-    if (any(ix = (cov.types == 'sequence'))){
-        for (cov in covariates[ix]){
-            if (is.character(cov$track)){
-                cov$track = tryCatch(readRDS(cov$track), error = function(e) 'Error: not ffTrack')
-            }
-            if (class(cov$track) != 'ffTrack'){
-                stop('Error: Sequence tracks must have ffTrack object as $track field or $track must be a path to an ffTrack object rds file')
-            }
-        }
-    }
-
-    if (any(ix = (cov.classes == 'ffTrack' & cov.types == 'sequence'))){
-        if (!all(sapply(covariates, function(x) !is.null(x$signature)))){
-            stop('Error: Sequence tracks must be ffTracks and have a $signature field specified (see fftab in ffTrack)')
-        }
-    }
-
-    if (verbose){
-        fmessage('Overlapping with covered intervals')
-    }
-
-    if (!is.null(covered)){
-      cache.dir <- Sys.getenv("FISHCACHE")
-      fl <- file.path(cache.dir, "covered_ovl.rds")
-      if (file.exists(fl)) {
-        fmessage(paste("...reading overlaps from cache [FISHCACHE environment variable]:", fl,
-                       "To stop cache read, delete", basename(fl)))
-        ov <- readRDS(fl)
-      } else {
-        ov = gr.findoverlaps(hypotheses, covered, verbose = verbose>1, max.chunk = max.chunk, mc.cores = mc.cores)
-        
-        if (nchar(cache.dir) > 0 && file.exists(cache.dir)) {
-          fmessage(paste("...caching overlaps to [FISHCACHE environment variable]:", fl,
-                         "To stop caching, remove FISHCACHE var", basename(fl)))
-          saveRDS(ov, file=fl, compress=FALSE)
-        }
-        
-      }
-    } else {
-      ov = hypotheses[, c()]
-      ov$query.id = ov$subject.id = 1:length(hypotheses)
-    }
   
-  if (verbose){
-    fmessage('Finished overlapping with covered intervals')
-    }
-
-    counts.unique = NULL
-
-    if (length(ov) > 0){
-
-        if (!is.null(events)){
-
-          if (inherits(events, 'GRanges')){
-
-            if (!is.null(idcol))
-              {
-                if (!(idcol %in% names(mcols(events))))
-                {
-                  stop(paste('Column', idcol, 'not found in events'))
-                }
-              }
-
-            ev = gr.fix(events[gr.in(events, ov)])
-
-            ## weighing each event by width means that each event will get one
-            ## total count, and if an event is split between two tile windows
-            ## then it will contribute a fraction of event proprotional to the number
-            ## oof bases overlapping
-            counts = coverage(ev, weight = 1/width(ev))
-
-            oix = which(gr.in(ov, events))
-
-            counts.unique = data.table(V2 = 1:length(hypotheses), final_count = 0)
-            setkey(counts.unique, V2)
-
-            if (!is.null(idcap) & length(events)>0){
-
-              if(!is.numeric(idcap)){
-                stop('Error: idcap must be of type numeric')
-              }
-
-              if(!("ID" %in% colnames(values(events))) & is.null(idcol)){
-                events$ID = c(1:length(events))
-              }
-
-              ev2 = gr.findoverlaps(events,ov, max.chunk = max.chunk, mc.cores = mc.cores, verbose = verbose>1)
-
-              if (length(ev2)>0)
-              {
-                if(is.null(idcol)){
-                  ev2$ID = events$ID[ev2$query.id]
-                } else{
-                  if (!(idcol %in% names(mcols(events))))
-                  {
-                    stop(paste('Column', idcol, 'not found in events'))
-                  }
-                  if (!is.infinite(idcap) & verbose)
-                    fmessage('Applying idcap of ', idcap, ' on idcol ', idcol, '.')
-
-                  ev2$ID = mcols(events)[,idcol][ev2$query.id]
-                }
-
-                ev2$target.id = ov$query.id[ev2$subject.id]
-                tab = as.data.table(cbind(ev2$ID, ev2$target.id))
-                counts.unique = tab[, dummy :=1][, .(count = sum(dummy)), keyby =.(V1, V2)][, count := pmin(idcap, count)][, .(final_count = sum(count)), keyby = V2]
-              }
-            }
-          }  else {
-            ## assume it is an Rle of event counts along the genome
-            counts = events
-            oix = 1:length(ov)
+  if (weightEvents)
+    idcap = NULL
+  
+  ## load the hypotheses
+  hypotheses <- load.fish.track(hypotheses)
+  
+  if (!is.null(out.path))
+    tryCatch(saveRDS(hypotheses, paste(gsub('.rds', '', out.path), '.source.rds', sep = ''), compress=FALSE), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
+  
+  ## check that the input covariates are of correct types
+  check.covars(covariates)
+  
+  ## overlap the hypotheses with the covered intervals
+  overlap.hypoth.covered(hypotheses, covered, verbose=verbose)
+  
+  counts.unique = NULL
+  
+  if (length(ov) > 0 && !is.null(events)) {
+    
+    if (inherits(events, 'GRanges')) {
+      
+      if (!is.null(idcol) && !(idcol %in% names(mcols(events))))
+        stop(paste('Column', idcol, 'not found in events'))
+      
+      ## subset the events to only those that remain in the overlap regions
+      ev = gUtils::gr.fix(events[gUtils::gr.in(events, ov)])
+      
+      ## weighing each event by width means that each event will get one
+      ## total count, and if an event is split between two tile windows
+      ## then it will contribute a fraction of event proprotional to the number
+      ## oof bases overlapping
+      counts = coverage(ev, weight = 1/width(ev))
+      
+      oix = which(gUtils::gr.in(ov, events))
+      
+      counts.unique = data.table::data.table(V2 = 1:length(hypotheses), final_count = 0)
+      data.table::setkey(counts.unique, V2)
+      
+      if (!is.null(idcap) & length(events)>0){
+        
+        if (!is.numeric(idcap))
+          stop('Error: idcap must be of type numeric')
+        
+        if (!("ID" %in% colnames(values(events))) & is.null(idcol))
+          events$ID = c(1:length(events))
+        
+        ## find which events are contained in the eligible hypothesis territory
+        ev2 = gUtils::gr.findoverlaps(events,ov, max.chunk = max.chunk, mc.cores = mc.cores, verbose = verbose>1)
+        
+        if (length(ev2)>0) {
+          if (is.null(idcol)){
+            ev2$ID = events$ID[ev2$query.id]
+          } else {
+            if (!(idcol %in% names(mcols(events))))
+              stop(paste('Column', idcol, 'not found in events'))
+            fmessage('Applying idcap of ', idcap, ' on idcol ', idcol, '.',
+                     verbose=!is.infinite(idcap) && verbose)
+            ev2$ID = mcols(events)[,idcol][ev2$query.id]
           }
-
-          if (verbose){
-            fmessage('Computing event counts')
-          }
-
-          ov$count = 0
-
-          if (length(oix)>0 & is.null(idcap)){
-            ov$count[oix] = fftab(counts, ov[oix], chunksize = ff.chunk, na.rm = TRUE, mc.cores = mc.cores, verbose = verbose)$score
-          }
-
-          if (!is.null(out.path)){
-            tryCatch(saveRDS(ov, paste(out.path, '.intermediate.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
-          }
-
-          if (verbose){
-            fmessage('Finished counting events')
-          }
+          
+          ev2$target.id = ov$query.id[ev2$subject.id]
+          tab = as.data.table(cbind(ev2$ID, ev2$target.id))
+          counts.unique = tab[, dummy :=1][, .(count = sum(dummy)), keyby =.(V1, V2)][, count := pmin(idcap, count)][, .(final_count = sum(count)), keyby = V2]
         }
+      }
+    }  else {
+      ## assume it is an Rle of event counts along the genome
+      counts = events
+      oix = 1:length(ov)
     }
-
-
+    
+    fmessage('Computing event counts', verbose=verbose)
+    
+    ov$count = 0
+    
+    if (length(oix)>0 & is.null(idcap))
+      ov$count[oix] = fftab(counts, ov[oix], chunksize = ff.chunk, na.rm = TRUE, mc.cores = mc.cores, verbose = verbose)$score
+    
+    if (!is.null(out.path))
+      tryCatch(saveRDS(ov, paste(out.path, '.intermediate.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
+    
+    fmessage('Finished counting events', verbose=verbose)
+  }
+  
+  
   for (nm in names(covariates)){
     
     cov = covariates[[nm]]
     
-    if (verbose){
-      fmessage('Annotating track ', nm, '')
-    }
+    fmessage('Annotating track ', nm, '', verbose=verbose)
 
-    if (cov$type == 'sequence'){
+    cov$pad   <- ifelse(is.na(cov$pad), pad, cov$pad)
+    cov$na.rm <- ifelse(is.null(cov$na.rm), na.rm, cov$na.rm)
 
-      if (is.null(cov$grep)){
-        cov$grep = FALSE
-      }
+    if (cov$type == 'sequence') {
       
-      if (verbose){
-        fmessage('Starting fftab for track', nm, '')
-      }
+      cov$grep <- ifelse(is.null(cov$grep), FALSE, cov$grep)
       
-      if (!is.list(cov$signature)){
+      fmessage('Starting fftab for track', nm, '', verbose=verbose)
+      
+      if (!is.list(cov$signature)) 
         cov$signature = list(cov$signature)
-      }
       
-      if (is.na(names(cov$signature))){
-        if (length(cov$signature) > 1){
-          names(cov$signature) = 1:length(cov$signature)
-        }
-      }
+      if (is.na(names(cov$signature)) && length(cov$signature) > 1)
+        names(cov$signature) = 1:length(cov$signature)
       
       if (!is.na(names(cov$signature))){
         names(cov$signature) = paste(nm, names(cov$signature), sep = '.')
@@ -383,35 +394,20 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
         names(cov$signature) = nm
       }
       
-      if (is.na(cov$pad)){
-        cov$pad = pad
-      }
-      
       val = fftab(cov$track, ov + cov$pad, cov$signature, chunksize = ff.chunk, verbose = verbose, FUN = mean, na.rm = TRUE, grep = cov$grep, mc.cores = mc.cores)
       values(ov) = values(val)
       
-      if (verbose){
-        fmessage('Finished fftab for track', nm, '')
-      }
+      fmessage('Finished fftab for track', nm, '', verbose=verbose)
       
       if (!is.null(out.path)){
         tryCatch(saveRDS(ov, paste(out.path, '.intermediate.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
       }
-    } else if (cov$type == 'numeric'){
-      if (is.character(cov$track)){
-        if (grepl('.rds$', cov$track)){
-          cov$track = readRDS(cov$track)
-        } else{
-          ## assume it is a UCSC format
-          library(rtracklayer)
-          cov$track = rtracklayer::import(cov$track)
-        }
-      }
       
-      if (is.na(cov$pad)){
-        cov$pad = pad
-      }
-      if (is(cov$track, 'ffTrack') | is(cov$track, 'RleList')){
+    } else if (cov$type == 'numeric'){
+
+      cov$track <- load.fish.track(cov$track)
+      
+      if (is(cov$track, 'ffTrack') || is(cov$track, 'RleList')){
         val = fftab(cov$track, ov + cov$pad, signature = cov$signature, FUN = sum, verbose = verbose, chunksize = ff.chunk, grep = cov$grep, mc.cores = mc.cores)
         values(ov) = values(val)
       } else{
@@ -419,10 +415,7 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
           ## then must be GRanges
           cov$field = 'score'
         }
-        if (is.na(cov$na.rm)){
-          
-        }
-
+        
         ## read from cached overlaps OR perform new
         new.col <- cache.newcol.read(cache.dir, nm, cov$type)
         if (!nrow(new.col)) {
@@ -438,32 +431,14 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
       if (!is.null(out.path)){
         tryCatch(saveRDS(ov, paste(out.path, '.intermediate.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
       }
+      
     } else if (cov$type == 'interval'){
+
+      cov$track <- load.fish.track(cov$track)
       
-      if (is.character(cov$track)){
-        
-        if (grepl('.rds$', cov$track)){
-          cov$track = readRDS(cov$track)
-        } else{
-          ## assume it is a UCSC format
-          require(rtracklayer)
-          cov$track = rtracklayer::import(cov$track)
-        }
-        
-      }
-      
-      if (is(cov, 'GRanges')){
+      if (is(cov, 'GRanges'))
         stop('Error: Interval tracks must be GRanges')
-      }
-      
-      if (is.null(cov$pad)){
-        cov$pad = pad
-      }
-      
-      if (is.null(cov$na.rm)){
-        cov$na.rm = na.rm
-      }
-      
+            
       cov$track = reduce(cov$track)
 
       ## read from cached overlaps OR perform new
@@ -483,11 +458,10 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
         tryCatch(saveRDS(ov, paste(out.path, '.intermediate.rds', sep = '')), error = function(e) warning(sprintf('Error writing to file %s', out.file)))
       }
     }
-    
+    print(nm)
   } # end covariate loop
   
   ovdt = gr2dt(ov)  
-  
   cmd = 'list(eligible = sum(width), ';
   
   if (!is.null(events)){
@@ -495,8 +469,7 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
   } else{
     cmd = paste(cmd, 'count = NA', sep = '')
   }
-  
-  
+
   cov.nm = setdiff(names(values(ov)), c('eligible', 'count', 'query.id', 'subject.id'))
   
   if (length(ov) > 0){
@@ -546,13 +519,9 @@ annotate.hypotheses = function(hypotheses, covered = NULL, events = NULL,  mc.co
           values(hypotheses)[[m]] = as.numeric(NA)
         }
     }
-  
   return(hypotheses)
   
 }
-
-
-
 
 #' @name aggregate.hypotheses
 #' @title title
@@ -924,13 +893,11 @@ score.hypotheses = function(hypotheses, covariates = names(values(hypotheses)), 
         formula = eval(parse(text = paste('count', " ~ ", paste(c('offset(1*eligible)', covariates), collapse = "+")))) ## make the formula with covariates
 
       if (nb){
-        ##Kiran modified to return error message
-        g <- tryCatch({
-           glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
-           error = function(e){
-           e$message <- "Fails to Fit NB"
-             stop(e)}
-           )      
+            g <- tryCatch({glm.nb(formula, data = as.data.frame(tdt), maxit = iter)},
+                          error=function (e) {
+                            formula = eval(parse(text = paste('count', " ~ ", paste(c('eligible', covariates), collapse = "+")))) ## make the formula with covariates
+                            glm.nb(formula, data = as.data.frame(tdt), maxit = iter)
+                          })
       } else{
         if (verbose)
         {
@@ -3922,8 +3889,10 @@ validate_hypotheses = function(value)
 }
 
 
-fmessage = function(..., pre = 'FishHook')
-  message(pre, ' ', paste0(as.character(Sys.time()), ': '), ...)
+fmessage = function(..., verbose=TRUE, pre = 'FishHook') {
+  if (verbose)
+    message(pre, ' ', paste0(as.character(Sys.time()), ': '), ...)
+}
 
 
 dedup = function(x, suffix = '.')
